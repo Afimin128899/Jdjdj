@@ -1,10 +1,11 @@
 import asyncio
 import os
 import re
+import sqlite3
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, FSInputFile
+from aiogram.types import Message, CallbackQuery
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -37,6 +38,25 @@ def get_code_keyboard():
     builder.adjust(1)
     return builder.as_markup()
 
+# ================== ФИКС СЕССИИ ==================
+def fix_session(session_path: str):
+    """Добавляет колонку version, если её нет (исправляет ошибку no such column: version)"""
+    try:
+        conn = sqlite3.connect(session_path)
+        cursor = conn.cursor()
+
+        cursor.execute("PRAGMA table_info(sessions)")
+        columns = [col[1] for col in cursor.fetchall()]
+
+        if "version" not in columns:
+            cursor.execute("ALTER TABLE sessions ADD COLUMN version INTEGER DEFAULT 1")
+            conn.commit()
+            print(f"[+] Колонка version добавлена в {session_path}")
+
+        conn.close()
+    except Exception as e:
+        print(f"[!] Не удалось починить сессию: {e}")
+
 # ================== ОБРАБОТЧИКИ ==================
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext):
@@ -62,6 +82,9 @@ async def receive_session(message: Message, state: FSMContext):
     # Скачиваем файл
     await bot.download(document, destination=session_path)
 
+    # Чиним сессию сразу после загрузки
+    fix_session(str(session_path))
+
     await state.update_data(session_path=str(session_path))
     await state.set_state(None)
 
@@ -84,6 +107,9 @@ async def get_code_handler(callback: CallbackQuery, state: FSMContext):
     await callback.answer("Ищу код...")
 
     try:
+        # Ещё раз чиним на всякий случай
+        fix_session(session_path)
+
         client = TelegramClient(session_path, API_ID, API_HASH)
         await client.connect()
 
@@ -94,9 +120,8 @@ async def get_code_handler(callback: CallbackQuery, state: FSMContext):
 
         # Ищем сообщения от официального Telegram (777000)
         code = None
-        async for message in client.iter_messages(777000, limit=15):
+        async for message in client.iter_messages(777000, limit=20):
             if message.message:
-                # Ищем 5-значный или 6-значный код
                 match = re.search(r'\b(\d{5,6})\b', message.message)
                 if match:
                     code = match.group(1)
@@ -125,7 +150,11 @@ async def get_code_handler(callback: CallbackQuery, state: FSMContext):
             reply_markup=get_code_keyboard()
         )
     except Exception as e:
-        await callback.message.answer(f"❌ Ошибка: <code>{e}</code>", parse_mode="HTML")
+        await callback.message.answer(
+            f"❌ Ошибка: <code>{e}</code>",
+            parse_mode="HTML",
+            reply_markup=get_code_keyboard()
+        )
 
 @dp.callback_query(F.data == "delete_session")
 async def delete_session_handler(callback: CallbackQuery, state: FSMContext):
