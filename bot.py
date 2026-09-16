@@ -1,16 +1,13 @@
 import asyncio
-import re
 import shutil
 import zipfile
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, FSInputFile
-from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, FSInputFile
+from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from telethon import TelegramClient
 from telethon.errors import (
@@ -32,147 +29,109 @@ WORK_DIR.mkdir(exist_ok=True)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-class CheckStates(StatesGroup):
-    waiting_sessions = State()
-
-def get_main_keyboard():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📦 Проверить пачку сессий", callback_data="start_check")
-    builder.adjust(1)
-    return builder.as_markup()
-
 @dp.message(CommandStart())
-async def start(message: Message, state: FSMContext):
-    await state.clear()
+async def start(message: Message):
     await message.answer(
         "🔍 <b>Проверка сессий</b>\n\n"
-        "Отправь мне:\n"
-        "• Архив <b>.zip</b> с .session файлами\n"
-        "• Или несколько .session файлов подряд\n\n"
-        "Я проверю до 100 штук и верну только <b>живые номера</b>.",
-        parse_mode="HTML",
-        reply_markup=get_main_keyboard()
-    )
-
-@dp.callback_query(F.data == "start_check")
-async def start_check(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(CheckStates.waiting_sessions)
-    await state.update_data(files=[])
-    
-    await callback.message.edit_text(
-        "Присылай сессии (архив .zip или файлы .session).\n"
-        "Когда закончишь — напиши <b>/check</b>",
+        "Просто отправь мне <b>.zip</b> архив с файлами <code>.session</code>\n"
+        "Я проверю до 100 штук и верну только живые номера.",
         parse_mode="HTML"
     )
-    await callback.answer()
 
-@dp.message(CheckStates.waiting_sessions, F.document)
-async def receive_file(message: Message, state: FSMContext):
+@dp.message(F.document)
+async def handle_zip(message: Message):
     document = message.document
-    data = await state.get_data()
-    files = data.get("files", [])
 
-    user_dir = WORK_DIR / str(message.from_user.id)
-    user_dir.mkdir(exist_ok=True)
-
-    file_path = user_dir / document.file_name
-    await bot.download(document, destination=file_path)
-
-    # Если это zip — распаковываем
-    if document.file_name.lower().endswith(".zip"):
-        try:
-            with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                zip_ref.extractall(user_dir)
-            
-            # Собираем все .session из архива
-            for session_file in user_dir.rglob("*.session"):
-                files.append(str(session_file))
-            
-            await message.answer(f"✅ Архив распакован. Найдено сессий: {len(list(user_dir.rglob('*.session')))}")
-        except Exception as e:
-            await message.answer(f"Ошибка распаковки: {e}")
-            return
-    else:
-        if document.file_name.endswith(".session"):
-            files.append(str(file_path))
-            await message.answer(f"✅ Файл добавлен ({len(files)} шт.)")
-        else:
-            await message.answer("Нужен .session или .zip")
-            return
-
-    await state.update_data(files=files)
-
-@dp.message(Command("check"))
-async def run_check(message: Message, state: FSMContext):
-    data = await state.get_data()
-    files = data.get("files", [])
-
-    if not files:
-        await message.answer("Сначала пришли сессии.")
+    if not document.file_name.lower().endswith(".zip"):
+        await message.answer("Пришли именно <b>.zip</b> архив с сессиями", parse_mode="HTML")
         return
 
-    # Ограничиваем до 100
-    files = files[:100]
-    total = len(files)
+    user_id = message.from_user.id
+    user_dir = WORK_DIR / str(user_id)
 
-    status_msg = await message.answer(f"⏳ Проверяю {total} сессий...")
+    # Чистим старую папку
+    if user_dir.exists():
+        shutil.rmtree(user_dir, ignore_errors=True)
+    user_dir.mkdir(parents=True)
+
+    # Скачиваем архив
+    zip_path = user_dir / "sessions.zip"
+    await bot.download(document, destination=zip_path)
+
+    status = await message.answer("📦 Распаковываю архив...")
+
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(user_dir)
+    except Exception as e:
+        await status.edit_text(f"❌ Не удалось распаковать архив:\n<code>{e}</code>", parse_mode="HTML")
+        return
+
+    # Собираем все .session
+    session_files = list(user_dir.rglob("*.session"))
+    session_files = session_files[:100]  # максимум 100
+
+    if not session_files:
+        await status.edit_text("❌ В архиве не найдено ни одного .session файла")
+        return
+
+    total = len(session_files)
+    await status.edit_text(f"⏳ Найдено {total} сессий. Начинаю проверку...")
 
     valid_numbers = []
     dead = 0
     errors = 0
 
-    for i, session_path in enumerate(files, 1):
+    for i, session_path in enumerate(session_files, 1):
+        client = None
         try:
             client = TelegramClient(
-                session_path,
+                str(session_path),
                 API_ID,
                 API_HASH,
-                device_model="Session Checker",
-                system_version="1.0",
+                device_model="SessionChecker",
+                system_version="Windows 10",
                 app_version="1.0"
             )
-            
             await client.connect()
 
             if await client.is_user_authorized():
                 me = await client.get_me()
                 phone = me.phone
                 if phone:
-                    if not phone.startswith("+"):
-                        phone = "+" + phone
+                    if not str(phone).startswith("+"):
+                        phone = "+" + str(phone)
                     valid_numbers.append(phone)
             else:
                 dead += 1
 
-            await client.disconnect()
-
-        except (AuthKeyUnregisteredError, AuthKeyDuplicatedError, 
+        except (AuthKeyUnregisteredError, AuthKeyDuplicatedError,
                 UserDeactivatedError, UserDeactivatedBanError):
             dead += 1
         except SessionPasswordNeededError:
-            # Есть 2FA, но сессия живая — можно считать валидной
+            # Сессия живая, но с 2FA
             try:
                 me = await client.get_me()
                 phone = me.phone
                 if phone:
-                    if not phone.startswith("+"):
-                        phone = "+" + phone
+                    if not str(phone).startswith("+"):
+                        phone = "+" + str(phone)
                     valid_numbers.append(f"{phone} (2FA)")
             except:
                 dead += 1
-            finally:
-                await client.disconnect()
         except Exception:
             errors += 1
-            try:
-                await client.disconnect()
-            except:
-                pass
+        finally:
+            if client:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
 
-        # Обновляем статус каждые 10 сессий
-        if i % 10 == 0 or i == total:
+        # Обновляем прогресс каждые 5–10 сессий
+        if i % 8 == 0 or i == total:
             try:
-                await status_msg.edit_text(
+                await status.edit_text(
                     f"⏳ Проверено: {i}/{total}\n"
                     f"✅ Живых: {len(valid_numbers)}\n"
                     f"❌ Мёртвых: {dead}\n"
@@ -181,44 +140,33 @@ async def run_check(message: Message, state: FSMContext):
             except:
                 pass
 
-        await asyncio.sleep(0.3)  # небольшая пауза, чтобы не долбить
+        await asyncio.sleep(0.25)
 
-    # Формируем результат
+    # ===== Результат =====
     if valid_numbers:
-        result_text = f"✅ <b>Живые номера ({len(valid_numbers)}):</b>\n\n"
-        result_text += "\n".join(valid_numbers)
+        text = f"✅ <b>Живые номера ({len(valid_numbers)}):</b>\n\n"
+        text += "\n".join(valid_numbers)
+        text += f"\n\n📊 Всего: {total} | Живых: {len(valid_numbers)} | Мёртвых: {dead} | Ошибок: {errors}"
+
+        # Если номеров много — отправляем файлом
+        if len(valid_numbers) > 40:
+            result_file = user_dir / "valid_numbers.txt"
+            result_file.write_text("\n".join(valid_numbers), encoding="utf-8")
+            await message.answer_document(
+                FSInputFile(result_file),
+                caption=f"✅ Найдено живых номеров: <b>{len(valid_numbers)}</b>",
+                parse_mode="HTML"
+            )
+        else:
+            await message.answer(text, parse_mode="HTML")
     else:
-        result_text = "❌ Живых сессий не найдено."
-
-    result_text += f"\n\n📊 Итого:\n• Всего проверено: {total}\n• Живых: {len(valid_numbers)}\n• Мёртвых: {dead}\n• Ошибок: {errors}"
-
-    # Если много номеров — отправляем файлом
-    if len(valid_numbers) > 30:
-        result_file = WORK_DIR / f"valid_{message.from_user.id}.txt"
-        result_file.write_text("\n".join(valid_numbers), encoding="utf-8")
-        await message.answer_document(
-            FSInputFile(result_file),
-            caption=f"✅ Найдено живых: {len(valid_numbers)}"
+        await message.answer(
+            f"❌ Живых сессий не найдено.\n\n"
+            f"Проверено: {total}\nМёртвых: {dead}\nОшибок: {errors}"
         )
-        result_file.unlink(missing_ok=True)
-    else:
-        await message.answer(result_text, parse_mode="HTML")
 
-    # Чистим временные файлы
-    user_dir = WORK_DIR / str(message.from_user.id)
-    if user_dir.exists():
-        shutil.rmtree(user_dir, ignore_errors=True)
-
-    await state.clear()
-    await message.answer("Проверка завершена.", reply_markup=get_main_keyboard())
-
-@dp.message(Command("cancel"))
-async def cancel(message: Message, state: FSMContext):
-    await state.clear()
-    user_dir = WORK_DIR / str(message.from_user.id)
-    if user_dir.exists():
-        shutil.rmtree(user_dir, ignore_errors=True)
-    await message.answer("Отменено.", reply_markup=get_main_keyboard())
+    # Чистим за собой
+    shutil.rmtree(user_dir, ignore_errors=True)
 
 async def main():
     print("Бот проверки сессий запущен")
