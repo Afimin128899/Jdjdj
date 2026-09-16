@@ -1,7 +1,6 @@
 import asyncio
 import shutil
 import zipfile
-import traceback
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -33,8 +32,8 @@ dp = Dispatcher()
 async def start(message: Message):
     await message.answer(
         "🔍 <b>Проверка сессий</b>\n\n"
-        "Отправь мне <b>.zip</b> архив с файлами <code>.session</code>\n"
-        "Я проверю их и верну только живые номера.",
+        "Отправь <b>.zip</b> с файлами <code>.session</code>\n"
+        "Я верну архив только с <b>живыми</b> сессиями.",
         parse_mode="HTML"
     )
 
@@ -43,19 +42,20 @@ async def handle_zip(message: Message):
     document = message.document
 
     if not document.file_name.lower().endswith(".zip"):
-        await message.answer("Нужен именно файл <b>.zip</b>", parse_mode="HTML")
+        await message.answer("Нужен файл <b>.zip</b>", parse_mode="HTML")
         return
 
     user_id = message.from_user.id
     user_dir = WORK_DIR / str(user_id)
+    valid_dir = user_dir / "valid"
 
-    # Полностью чистим папку пользователя
+    # Чистим
     if user_dir.exists():
         shutil.rmtree(user_dir, ignore_errors=True)
-    user_dir.mkdir(parents=True, exist_ok=True)
+    user_dir.mkdir(parents=True)
+    valid_dir.mkdir()
 
-    zip_path = user_dir / "archive.zip"
-    
+    zip_path = user_dir / "input.zip"
     status = await message.answer("📥 Скачиваю архив...")
 
     try:
@@ -70,26 +70,29 @@ async def handle_zip(message: Message):
         with zipfile.ZipFile(zip_path, 'r') as zf:
             zf.extractall(user_dir)
     except Exception as e:
-        await status.edit_text(f"❌ Не удалось распаковать архив:\n<code>{e}</code>", parse_mode="HTML")
+        await status.edit_text(f"❌ Ошибка распаковки: {e}")
         return
 
-    # Ищем все .session файлы (даже во вложенных папках)
     session_files = list(user_dir.rglob("*.session"))
     session_files = [f for f in session_files if f.is_file()][:100]
 
     if not session_files:
-        await status.edit_text("❌ В архиве нет ни одного файла .session")
+        await status.edit_text("❌ В архиве нет .session файлов")
         return
 
     total = len(session_files)
-    await status.edit_text(f"🔍 Найдено {total} сессий. Начинаю проверку...")
+    await status.edit_text(f"🔍 Найдено {total} сессий. Проверяю...")
 
-    valid = []
+    valid_count = 0
     dead = 0
     errors = 0
+    valid_phones = []
 
     for idx, session_path in enumerate(session_files, 1):
         client = None
+        is_valid = False
+        phone = None
+
         try:
             client = TelegramClient(
                 session=str(session_path),
@@ -97,31 +100,27 @@ async def handle_zip(message: Message):
                 api_hash=API_HASH,
                 device_model="Desktop",
                 system_version="Windows 10",
-                app_version="4.2.4",
-                lang_code="en",
-                system_lang_code="en"
+                app_version="4.2.4"
             )
 
-            await asyncio.wait_for(client.connect(), timeout=15)
+            await asyncio.wait_for(client.connect(), timeout=12)
 
-            if not await client.is_user_authorized():
-                dead += 1
-            else:
+            if await client.is_user_authorized():
                 me = await client.get_me()
                 phone = getattr(me, "phone", None)
                 if phone:
                     phone = str(phone)
                     if not phone.startswith("+"):
                         phone = "+" + phone
-                    valid.append(phone)
-                else:
-                    dead += 1
+                    is_valid = True
+            else:
+                dead += 1
 
-        except (AuthKeyUnregisteredError, AuthKeyDuplicatedError, 
+        except (AuthKeyUnregisteredError, AuthKeyDuplicatedError,
                 UserDeactivatedError, UserDeactivatedBanError, AuthKeyError):
             dead += 1
         except SessionPasswordNeededError:
-            # Сессия живая + 2FA
+            # Считаем живой (есть 2FA)
             try:
                 me = await client.get_me()
                 phone = getattr(me, "phone", None)
@@ -129,15 +128,11 @@ async def handle_zip(message: Message):
                     phone = str(phone)
                     if not phone.startswith("+"):
                         phone = "+" + phone
-                    valid.append(f"{phone} (2FA)")
-                else:
-                    dead += 1
+                    is_valid = True
             except:
                 dead += 1
-        except Exception as e:
+        except Exception:
             errors += 1
-            # Раскомментируй следующую строку, если хочешь видеть ошибки в консоли
-            # print(f"Ошибка на {session_path.name}: {e}")
         finally:
             if client:
                 try:
@@ -145,54 +140,66 @@ async def handle_zip(message: Message):
                 except:
                     pass
 
-        # Обновляем статус
-        if idx % 7 == 0 or idx == total:
+        # Если сессия живая — копируем её в папку valid
+        if is_valid and phone:
+            valid_count += 1
+            valid_phones.append(phone)
+
+            # Имя файла = номер телефона
+            new_name = f"{phone}.session"
+            dest = valid_dir / new_name
+            try:
+                shutil.copy2(session_path, dest)
+            except:
+                # Если не получилось по номеру — оставляем оригинальное имя
+                shutil.copy2(session_path, valid_dir / session_path.name)
+
+        if idx % 6 == 0 or idx == total:
             try:
                 await status.edit_text(
-                    f"⏳ Прогресс: {idx}/{total}\n"
-                    f"✅ Живых: {len(valid)}\n"
+                    f"⏳ {idx}/{total}\n"
+                    f"✅ Живых: {valid_count}\n"
                     f"❌ Мёртвых: {dead}\n"
                     f"⚠️ Ошибок: {errors}"
                 )
             except:
                 pass
 
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.15)
 
-    # ===== Результат =====
-    result_text = (
-        f"📊 <b>Результат проверки</b>\n\n"
-        f"Всего сессий: <b>{total}</b>\n"
-        f"Живых: <b>{len(valid)}</b>\n"
-        f"Мёртвых: <b>{dead}</b>\n"
-        f"Ошибок: <b>{errors}</b>\n\n"
-    )
+    # ===== Создаём архив с живыми сессиями =====
+    if valid_count > 0:
+        output_zip = user_dir / "valid_sessions.zip"
+        
+        with zipfile.ZipFile(output_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for file in valid_dir.glob("*.session"):
+                zf.write(file, arcname=file.name)
 
-    if valid:
-        result_text += "<b>Живые номера:</b>\n" + "\n".join(valid)
+        caption = (
+            f"✅ <b>Готово!</b>\n\n"
+            f"Живых сессий: <b>{valid_count}</b>\n"
+            f"Мёртвых: {dead}\n"
+            f"Ошибок: {errors}"
+        )
 
-        if len(valid) > 35:
-            # Отправляем файлом
-            txt_path = user_dir / "valid_numbers.txt"
-            txt_path.write_text("\n".join(valid), encoding="utf-8")
-            await message.answer_document(
-                FSInputFile(txt_path),
-                caption=f"✅ Живых номеров: <b>{len(valid)}</b>",
-                parse_mode="HTML"
-            )
-        else:
-            await message.answer(result_text, parse_mode="HTML")
+        await message.answer_document(
+            FSInputFile(output_zip),
+            caption=caption,
+            parse_mode="HTML"
+        )
     else:
-        await message.answer(result_text + "Живых сессий не найдено.", parse_mode="HTML")
+        await message.answer(
+            f"❌ Живых сессий не найдено\n\n"
+            f"Проверено: {total}\n"
+            f"Мёртвых: {dead}\n"
+            f"Ошибок: {errors}"
+        )
 
     # Очистка
-    try:
-        shutil.rmtree(user_dir, ignore_errors=True)
-    except:
-        pass
+    shutil.rmtree(user_dir, ignore_errors=True)
 
 async def main():
-    print("Бот запущен...")
+    print("Бот запущен")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
