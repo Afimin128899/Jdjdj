@@ -13,7 +13,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
 
-BOT_TOKEN = "8468979285:AAGz8Zq3N1F01XjFWxTfDfWuOPHGRTAjEjY"
+BOT_TOKEN = "8468979285:AAEdtVtNJt6UTXzpojrwY6aBOGnM1xSGEBA"
 API_ID = 34910343
 API_HASH = "d20860d195501ba0993b794f952b1ef1"
 
